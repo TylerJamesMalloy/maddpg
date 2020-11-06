@@ -1,3 +1,11 @@
+import logging, os
+
+import warnings
+warnings.filterwarnings("ignore")
+
+logging.disable(logging.WARNING)
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
 import argparse
 import numpy as np
 import tensorflow as tf
@@ -8,30 +16,56 @@ import maddpg.common.tf_util as U
 from maddpg.trainer.maddpg import MADDPGAgentTrainer
 import tensorflow.contrib.layers as layers
 
+# Only coop
+# Simple: 1 good 
+# Spread: 3 good 
+# Speaker Listener: 2 good
+# Reference: 2 good 
+
+# Only comp
+# Push: 1 good 1 adversary 
+
+# Mixed coop-comp
+# World Communication: 2 good 4 adversaries  
+# Tag: 3 adversaries 1 good 
+# Crypto: 2 good 1 adversary 
+# Adversary: 2 good  1 adversary 
+
+# python train.py --scenario simple_adversary --num-episode 25000 --adv-mic 0.0001 --good-mic 0 --num-adversaries 1 --save-dir ./Adversary/gDDPG/Models_0p0001/a5/ --plots-dir ./Adversary/gDDPG/Models_0p0001/a5/ --exp-name a5_0p0001
+
+# python train.py --scenario simple_adversary --num-episode 25000 --adv-mic 0 --good-mic 0.0001 --num-adversaries 1 --save-dir ./Adversary/gMACL/Models_0p0001/a5/ --plots-dir ./Adversary/gMACL/Models_0p0001/a5/ --exp-name a5_0p0001
+
+# python train.py --scenario simple_spread --num-episode 25000 --good-mic 0.0001 --save-dir ./Spread/gMACL/Models_0p0001/a5/ --plots-dir ./Spread/gMACL/Models_0p0001/a5/ --exp-name a5_0p0001
+
+# python train.py --scenario simple_speaker_listener --load-dir ./Speaker_Listener/gMACL/Models_0p001/a2/ --display
+
 def parse_args():
     parser = argparse.ArgumentParser("Reinforcement Learning experiments for multiagent environments")
     # Environment
     parser.add_argument("--scenario", type=str, default="simple", help="name of the scenario script")
     parser.add_argument("--max-episode-len", type=int, default=25, help="maximum episode length")
-    parser.add_argument("--num-episodes", type=int, default=60000, help="number of episodes")
+    parser.add_argument("--num-episodes", type=int, default=25000, help="number of episodes")
     parser.add_argument("--num-adversaries", type=int, default=0, help="number of adversaries")
     parser.add_argument("--good-policy", type=str, default="maddpg", help="policy for good agents")
     parser.add_argument("--adv-policy", type=str, default="maddpg", help="policy of adversaries")
+    parser.add_argument("--good-mic", type=str, default=1e-2, help="mutual information coefficient for good agents")
+    parser.add_argument("--adv-mic", type=str, default=0, help="mutual information coefficient for adversaries")
     # Core training parameters
     parser.add_argument("--lr", type=float, default=1e-2, help="learning rate for Adam optimizer")
     parser.add_argument("--gamma", type=float, default=0.95, help="discount factor")
     parser.add_argument("--batch-size", type=int, default=1024, help="number of episodes to optimize at the same time")
     parser.add_argument("--num-units", type=int, default=64, help="number of units in the mlp")
+    parser.add_argument("--sleep-regimen", action="store_true", default=False, help="only use mic while sleeping")
     # Checkpointing
     parser.add_argument("--exp-name", type=str, default=None, help="name of the experiment")
-    parser.add_argument("--save-dir", type=str, default="/tmp/policy/", help="directory in which training state and model should be saved")
-    parser.add_argument("--save-rate", type=int, default=1000, help="save model once every time this many episodes are completed")
+    parser.add_argument("--save-dir", type=str, default="./", help="directory in which training state and model should be saved")
+    parser.add_argument("--save-rate", type=int, default=100, help="save model once every time this many episodes are completed")
     parser.add_argument("--load-dir", type=str, default="", help="directory in which training state and model are loaded")
     # Evaluation
     parser.add_argument("--restore", action="store_true", default=False)
     parser.add_argument("--display", action="store_true", default=False)
     parser.add_argument("--benchmark", action="store_true", default=False)
-    parser.add_argument("--benchmark-iters", type=int, default=100000, help="number of iterations run for benchmarking")
+    parser.add_argument("--benchmark-iters", type=int, default=10000, help="number of iterations run for benchmarking")
     parser.add_argument("--benchmark-dir", type=str, default="./benchmark_files/", help="directory where benchmark data is saved")
     parser.add_argument("--plots-dir", type=str, default="./learning_curves/", help="directory where plot data is saved")
     return parser.parse_args()
@@ -64,13 +98,14 @@ def get_trainers(env, num_adversaries, obs_shape_n, arglist):
     trainers = []
     model = mlp_model
     trainer = MADDPGAgentTrainer
+
     for i in range(num_adversaries):
         trainers.append(trainer(
-            "agent_%d" % i, model, obs_shape_n, env.action_space, i, arglist,
+            "agent_%d" % i, model, obs_shape_n, env.action_space, i, arglist, agent_type="adversary",
             local_q_func=(arglist.adv_policy=='ddpg')))
     for i in range(num_adversaries, env.n):
         trainers.append(trainer(
-            "agent_%d" % i, model, obs_shape_n, env.action_space, i, arglist,
+            "agent_%d" % i, model, obs_shape_n, env.action_space, i, arglist, agent_type="good",
             local_q_func=(arglist.good_policy=='ddpg')))
     return trainers
 
@@ -160,6 +195,15 @@ def train(arglist):
             for agent in trainers:
                 loss = agent.update(trainers, train_step)
 
+                if(loss is not None and agent.sleep_regimen and agent.agent_mic != 0 and train_step % 100 == 0): # Change sleep frequency here if desired
+                    original_policy_loss = loss[1]
+                    new_loss = agent.update(trainers, train_step, sleeping=True)[1]
+                    sleep_iteration = 0
+                    while((sleep_iteration < 10) and (new_loss < original_policy_loss * 1.05)):
+                        new_loss = agent.update(trainers, train_step, sleeping=True)[1]
+                        sleep_iteration += 1 
+                        #print("sleep walking")
+
             # save model, display training output
             if terminal and (len(episode_rewards) % arglist.save_rate == 0):
                 U.save_state(arglist.save_dir, saver=saver)
@@ -179,6 +223,9 @@ def train(arglist):
 
             # saves final episode reward for plotting training curve later
             if len(episode_rewards) > arglist.num_episodes:
+                print(arglist.plots_dir)
+                print(arglist.exp_name)
+
                 rew_file_name = arglist.plots_dir + arglist.exp_name + '_rewards.pkl'
                 with open(rew_file_name, 'wb') as fp:
                     pickle.dump(final_ep_rewards, fp)
