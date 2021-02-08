@@ -5,16 +5,13 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 import numpy as np
 import random
-import tensorflow.compat.v1 as tf
-tf.disable_v2_behavior()
+import tensorflow as tf
 import maddpg.common.tf_util as U
 
 from scipy.stats import multivariate_normal
 
 from maddpg.common.distributions import make_pdtype
 from maddpg import AgentTrainer
-from maddpg.trainer.replay_buffer import ReplayBuffer
-
 
 def discount_with_dones(rewards, dones, gamma):
     discounted = []
@@ -153,7 +150,7 @@ def m_train(act_space_n, m_index, m_func, optimizer, mut_inf_coef=0, grad_norm_c
 
         return train, update_target_m, {'m_values': m_values, 'target_m_values': target_m_values}
 
-class MADDPGAgentTrainer(AgentTrainer):
+class MACLAgentTrainer(AgentTrainer):
     def __init__(self, name, model, obs_shape_n, act_space_n, agent_index, args, agent_type="good", local_q_func=False):
         self.name = name
         self.n = len(obs_shape_n)
@@ -204,6 +201,18 @@ class MADDPGAgentTrainer(AgentTrainer):
             local_q_func=local_q_func,
             num_units=args.num_units
         )
+        """
+        self.m_train, self.m_update, self.m_debug = m_train(
+            scope=self.name,
+            act_space_n=act_space_n,
+            m_index=agent_index,
+            m_func=model,
+            optimizer=tf.train.AdamOptimizer(learning_rate=args.lr),
+            mut_inf_coef=self.mic ,
+            grad_norm_clipping=0.5,
+            num_units=args.num_units
+        )
+        """
         # Create experience buffer
         self.replay_buffer = ReplayBuffer(1e6)
         self.max_replay_buffer_len = args.batch_size * args.max_episode_len
@@ -245,9 +254,9 @@ class MADDPGAgentTrainer(AgentTrainer):
 
         return action
 
-    def experience(self, obs, act, rew, new_obs, done, terminal):
+    def experience(self, obs, act, mask, rew, new_obs, done):
         # Store transition in the replay buffer.
-        self.replay_buffer.add(obs, act, rew, new_obs, float(done))
+        self.replay_buffer.add(obs, act, mask, rew, new_obs, float(done))
 
     def preupdate(self):
         self.replay_sample_index = None
@@ -255,20 +264,28 @@ class MADDPGAgentTrainer(AgentTrainer):
     def update(self, agents, t, sleeping=False):
         if len(self.replay_buffer) < self.max_replay_buffer_len: # replay buffer is not large enough
             return
-        if not t % 100 == 0:  # only update every 100 steps
+        if not t % 10 == 0:  # update every 10 steps
             return
-        
-        self.replay_sample_index = self.replay_buffer.make_index(self.args.batch_size)
+
+        smallest_batch_index = 0
+        smallest_batch_size = -1
+        for i in range(self.n):
+            if(smallest_batch_size == -1 or len(agents[i].replay_buffer) < smallest_batch_size):
+                smallest_batch_size = len(agents[i].replay_buffer)
+                smallest_batch_index = i
+
+        # Different agents have different amounts of experience, need to use the smallest to get list of experience from memory
+        self.replay_sample_index = agents[smallest_batch_index].replay_buffer.make_index(self.args.batch_size)
         obs_n = []
         obs_next_n = []
         act_n = []
         index = self.replay_sample_index
         for i in range(self.n):
-            obs, act, rew, obs_next, done = agents[i].replay_buffer.sample_index(index)
+            obs, act, mask, rew, obs_next, done = agents[i].replay_buffer.sample_index(index)
             obs_n.append(obs)
             obs_next_n.append(obs_next)
             act_n.append(act)
-        obs, act, rew, obs_next, done = self.replay_buffer.sample_index(index)
+        obs, act, masks, rew, obs_next, done = self.replay_buffer.sample_index(index)
         
         mir_penalty = 0
         if(self.mic > 0 and (not self.args.sleep_regimen or (self.args.sleep_regimen and sleeping))): # If sleep regimen is on, only use mic when sleeping
@@ -294,10 +311,13 @@ class MADDPGAgentTrainer(AgentTrainer):
                 pi_entropy = -1 * np.sum(logp_pi * p_pi)
 
                 mir_penalty = self.mic * (phi_entropy - pi_entropy)
+                
+                print("mir_penalty: ", mir_penalty)
+                print("mir_penalty: ", phi_entropy)
+                print("mir_penalty: ", pi_entropy)
             except:
                 mir_penalty = 0
         
-
         num_sample = 1
         target_q = 0.0
         for i in range(num_sample):
@@ -305,10 +325,6 @@ class MADDPGAgentTrainer(AgentTrainer):
             target_q_next = self.q_debug['target_q_values'](*(obs_next_n + target_act_next_n))
             target_q += (rew - mir_penalty) + self.args.gamma * (1.0 - done) * target_q_next
         target_q /= num_sample
-
-        print(target_q)
-        assert(False)
-
         q_loss = self.q_train(*(obs_n + act_n + [target_q]))
 
         # train p network
@@ -318,3 +334,96 @@ class MADDPGAgentTrainer(AgentTrainer):
         self.q_update()
 
         return [q_loss, p_loss, np.mean(target_q), np.mean(rew), np.mean(target_q_next), np.std(target_q)]
+
+import logging, os
+
+logging.disable(logging.WARNING)
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+import numpy as np
+import random
+
+class ReplayBuffer(object):
+    def __init__(self, size):
+        """Create Prioritized Replay buffer.
+
+        Parameters
+        ----------
+        size: int
+            Max number of transitions to store in the buffer. When the buffer
+            overflows the old memories are dropped.
+        """
+        self._storage = []
+        self._maxsize = int(size)
+        self._next_idx = 0
+
+    def __len__(self):
+        return len(self._storage)
+
+    def clear(self):
+        self._storage = []
+        self._next_idx = 0
+
+    def add(self, obs_t, action, mask, reward, obs_tp1, done):
+        data = (obs_t, action, mask, reward, obs_tp1, done)
+
+        if self._next_idx >= len(self._storage):
+            self._storage.append(data)
+        else:
+            self._storage[self._next_idx] = data
+        self._next_idx = (self._next_idx + 1) % self._maxsize
+
+    def _encode_sample(self, idxes):
+        obses_t, actions, masks, rewards, obses_tp1, dones = [], [], [], [], [], []
+        for i in idxes:
+            data = self._storage[i]
+            obs_t, action, mask, reward, obs_tp1, done = data
+            obses_t.append(np.array(obs_t, copy=False))
+            actions.append(np.array(action, copy=False))
+            masks.append(np.array(mask, copy=False))
+            rewards.append(reward)
+            obses_tp1.append(np.array(obs_tp1, copy=False))
+            dones.append(done)
+        return np.array(obses_t), np.array(actions), np.array(masks), np.array(rewards), np.array(obses_tp1), np.array(dones)
+
+    def make_index(self, batch_size):
+        return [random.randint(0, len(self._storage) - 1) for _ in range(batch_size)]
+
+    def make_latest_index(self, batch_size):
+        idx = [(self._next_idx - 1 - i) % self._maxsize for i in range(batch_size)]
+        np.random.shuffle(idx)
+        return idx
+
+    def sample_index(self, idxes):
+        return self._encode_sample(idxes)
+
+    def sample(self, batch_size):
+        """Sample a batch of experiences.
+
+        Parameters
+        ----------
+        batch_size: int
+            How many transitions to sample.
+
+        Returns
+        -------
+        obs_batch: np.array
+            batch of observations
+        act_batch: np.array
+            batch of actions executed given obs_batch
+        rew_batch: np.array
+            rewards received as results of executing act_batch
+        next_obs_batch: np.array
+            next set of observations seen after executing act_batch
+        done_mask: np.array
+            done_mask[i] = 1 if executing act_batch[i] resulted in
+            the end of an episode and 0 otherwise.
+        """
+        if batch_size > 0:
+            idxes = self.make_index(batch_size)
+        else:
+            idxes = range(0, len(self._storage))
+        return self._encode_sample(idxes)
+
+    def collect(self):
+        return self.sample(-1)

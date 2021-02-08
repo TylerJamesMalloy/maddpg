@@ -8,37 +8,38 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 import argparse
 import numpy as np
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
+tf.disable_v2_behavior()
 import time
 import pickle
 
 import maddpg.common.tf_util as U
-from maddpg.trainer.macl import MACLAgentTrainer
-import tensorflow.contrib.layers as layers
+from maddpg.trainer.maddpg import MADDPGAgentTrainer
+#from maddpg.trainer.macl import MACLAgentTrainer
 
-# python train_hanabi.py --num-episode 100000 --good-mic 0.001 --save-dir ./Hanabi/MACL/0p001/a1/ --plots-dir ./Hanabi/MACL/0p001/a1/ --exp-name a1_0p001
 
-# python train_hanabi.py --num-episode 100000 --good-mic 0 --save-dir ./Hanabi/DDPG/a1/ --plots-dir ./Hanabi/DDPG/a1/ --exp-name a1
-
-# python train_hanabi.py --num-episode 100000 --good-mic 0 --save-dir ./Hanabi/Test/a1/ --plots-dir ./Hanabi/Test/a1/ --exp-name test1
 
 def parse_args():
     parser = argparse.ArgumentParser("Reinforcement Learning experiments for multiagent environments")
     # Environment
-    parser.add_argument("--num-episodes", type=int, default=100000, help="number of episodes")
+    parser.add_argument("--scenario", type=str, default="simple", help="name of the scenario script")
+    parser.add_argument("--max-episode-len", type=int, default=25, help="maximum episode length")
+    parser.add_argument("--num-episodes", type=int, default=25000, help="number of episodes")
+    parser.add_argument("--num-adversaries", type=int, default=0, help="number of adversaries")
     parser.add_argument("--good-policy", type=str, default="maddpg", help="policy for good agents")
-    parser.add_argument("--good-mic", type=str, default=1e-3, help="mutual information coefficient for good agents")
-    parser.add_argument("--max-episode-len", type=int, default=100, help="maximum episode length, not used to limit game length" )
+    parser.add_argument("--adv-policy", type=str, default="maddpg", help="policy of adversaries")
+    parser.add_argument("--good-mic", type=str, default=1e-2, help="mutual information coefficient for good agents")
+    parser.add_argument("--adv-mic", type=str, default=0, help="mutual information coefficient for adversaries")
     # Core training parameters
     parser.add_argument("--lr", type=float, default=1e-2, help="learning rate for Adam optimizer")
-    parser.add_argument("--gamma", type=float, default=0.99, help="discount factor")
+    parser.add_argument("--gamma", type=float, default=0.95, help="discount factor")
     parser.add_argument("--batch-size", type=int, default=1024, help="number of episodes to optimize at the same time")
-    parser.add_argument("--num-units", type=int, default=128, help="number of units in the mlp")
+    parser.add_argument("--num-units", type=int, default=64, help="number of units in the mlp")
     parser.add_argument("--sleep-regimen", action="store_true", default=False, help="only use mic while sleeping")
     # Checkpointing
-    parser.add_argument("--exp-name", type=str, default="a1", help="name of the experiment")
-    parser.add_argument("--save-dir", type=str, default="./tmp/policy/", help="directory in which training state and model should be saved")
-    parser.add_argument("--save-rate", type=int, default=1000, help="save model once every time this many episodes are completed")
+    parser.add_argument("--exp-name", type=str, default=None, help="name of the experiment")
+    parser.add_argument("--save-dir", type=str, default="./", help="directory in which training state and model should be saved")
+    parser.add_argument("--save-rate", type=int, default=100, help="save model once every time this many episodes are completed")
     parser.add_argument("--load-dir", type=str, default="", help="directory in which training state and model are loaded")
     # Evaluation
     parser.add_argument("--restore", action="store_true", default=False)
@@ -46,44 +47,59 @@ def parse_args():
     parser.add_argument("--benchmark", action="store_true", default=False)
     parser.add_argument("--benchmark-iters", type=int, default=10000, help="number of iterations run for benchmarking")
     parser.add_argument("--benchmark-dir", type=str, default="./benchmark_files/", help="directory where benchmark data is saved")
-    parser.add_argument("--plots-dir", type=str, default="./Hanabi/", help="directory where plot data is saved")
+    parser.add_argument("--plots-dir", type=str, default="./learning_curves/", help="directory where plot data is saved")
     return parser.parse_args()
 
 def mlp_model(input, num_outputs, scope, reuse=False, num_units=64, rnn_cell=None):
     # This model takes as input an observation and returns values of all actions
     with tf.variable_scope(scope, reuse=reuse):
         out = input
-        out = layers.fully_connected(out, num_outputs=num_units, activation_fn=tf.nn.relu)
-        out = layers.fully_connected(out, num_outputs=num_units, activation_fn=tf.nn.relu)
-        out = layers.fully_connected(out, num_outputs=num_outputs, activation_fn=None)
+        out = tf.layers.dense(inputs=out, units=num_units, activation=tf.nn.relu)
+        out = tf.layers.dense(inputs=out, units=num_units, activation=tf.nn.relu)
+        out = tf.layers.dense(inputs=out, units=num_outputs, activation=None)
         return out
 
-def make_env(arglist, benchmark=False):
-    from multiagent.scenarios.simple_hanabi import HanabiEnv
+def make_env(scenario_name, arglist, benchmark=False):
+    from multiagent.environment import MultiAgentEnv
+    import multiagent.scenarios as scenarios
 
-    env = HanabiEnv()
+    # load scenario from script
+    scenario = scenarios.load(scenario_name + ".py").Scenario()
+    # create world
+    world = scenario.make_world()
+    # create multiagent environment
+    if benchmark:
+        env = MultiAgentEnv(world, scenario.reset_world, scenario.reward, scenario.observation, scenario.benchmark_data)
+    else:
+        env = MultiAgentEnv(world, scenario.reset_world, scenario.reward, scenario.observation)
     return env
 
-def get_trainers(env, obs_shape_n, arglist):
+def get_trainers(env, num_adversaries, obs_shape_n, arglist):
     trainers = []
     model = mlp_model
-    trainer = MACLAgentTrainer
-    for i in range(env.n):
-        act_shape_n = [env.action_space for i in range(env.n)]
+    trainer = MADDPGAgentTrainer
+
+    for i in range(num_adversaries):
         trainers.append(trainer(
-            "agent_%d" % i, model, obs_shape_n, act_shape_n, i, arglist, agent_type="good",
+            "agent_%d" % i, model, obs_shape_n, env.action_space, i, arglist, agent_type="adversary",
+            local_q_func=(arglist.adv_policy=='ddpg')))
+    for i in range(num_adversaries, env.n):
+        trainers.append(trainer(
+            "agent_%d" % i, model, obs_shape_n, env.action_space, i, arglist, agent_type="good",
             local_q_func=(arglist.good_policy=='ddpg')))
     return trainers
+
 
 def train(arglist):
     with U.single_threaded_session():
         # Create environment
-        env = make_env(arglist, arglist.benchmark)
-        
+        env = make_env(arglist.scenario, arglist, arglist.benchmark)
         # Create agent trainers
-        obs_shape_n = [env.observation_space.shape for i in range(env.n)]
-        trainers = get_trainers(env, obs_shape_n, arglist)
-        print('Using good policy {}'.format(arglist.good_policy))
+        obs_shape_n = [env.observation_space[i].shape for i in range(env.n)]
+
+        num_adversaries = min(env.n, arglist.num_adversaries)
+        trainers = get_trainers(env, num_adversaries, obs_shape_n, arglist)
+        print('Using good policy {} and adv policy {}'.format(arglist.good_policy, arglist.adv_policy))
 
         # Initialize
         U.initialize()
@@ -94,7 +110,7 @@ def train(arglist):
         if arglist.display or arglist.restore or arglist.benchmark:
             print('Loading previous state...')
             U.load_state(arglist.load_dir)
-        
+
         episode_rewards = [0.0]  # sum of rewards for all agents
         agent_rewards = [[0.0] for _ in range(env.n)]  # individual agent reward
         final_ep_rewards = []  # sum of rewards for training curve
@@ -105,65 +121,32 @@ def train(arglist):
         episode_step = 0
         train_step = 0
         t_start = time.time()
-        done = 0
-        current_player_index = 0
-
-        no_op_actions = False 
 
         print('Starting iterations...')
         while True:
             # get action
-            current_player_obs = np.asarray(obs_n)
-            original_action = trainers[current_player_index].action(current_player_obs)
+            action_n = [agent.action(obs) for agent, obs in zip(trainers,obs_n)]
+            # environment step
+            new_obs_n, rew_n, done_n, info_n = env.step(action_n)
+            episode_step += 1
+            done = all(done_n)
+            terminal = (episode_step >= arglist.max_episode_len)
+            # collect experience
+            for i, agent in enumerate(trainers):
+                agent.experience(obs_n[i], action_n[i], rew_n[i], new_obs_n[i], done_n[i], terminal)
+            obs_n = new_obs_n
 
-            if(no_op_actions):
-                action = np.random.choice(np.linspace(0, env.action_space.n-1, num=env.action_space.n, dtype=int), 1, p=original_action)[0] 
-                mask = env.getValidActions()
+            for i, rew in enumerate(rew_n):
+                episode_rewards[-1] += rew
+                agent_rewards[i][-1] += rew
 
-                while(mask[action] == 0):
-                    action = np.random.choice(np.linspace(0, env.action_space.n-1, num=env.action_space.n, dtype=int), 1, p=original_action)[0] 
-            else:
-                # get action mask
-                mask = env.getValidActions()
-                # zero out invalid options 
-                masked_actions = mask * original_action
-                # normalize 
-                masked_actions = masked_actions / np.nansum(masked_actions)
-                # Get action with given probability 
-                if(np.isnan(masked_actions).any()):
-                    print(current_player_obs)
-                    print(masked_actions)
-                    print(np.nansum(masked_actions))
-                    print(original_action)
-                try:
-                    action = np.random.choice(np.linspace(0, env.action_space.n-1, num=env.action_space.n, dtype=int), 1, p=masked_actions)[0] 
-                except: 
-                    print("Exception: choosing random action")
-                    action = np.random.choice(np.linspace(0, env.action_space.n-1, num=env.action_space.n, dtype=int), 1)[0]
-
-            new_obs, rew, done, info = env.step(action)
-
-            #trainers[current_player_index].experience(current_player_obs, original_action, mask, rew, new_obs, done)
-            trainers[current_player_index].experience(current_player_obs, masked_actions, mask, rew, new_obs, done)
-
-            current_player_index += 1
-            if(current_player_index >= len(trainers)):
-                current_player_index = 0
-                
-            
-            obs_n = new_obs
-
-            episode_rewards[-1] += rew
-            agent_rewards[current_player_index][-1] += rew
-
-            if done:
+            if done or terminal:
                 obs_n = env.reset()
                 episode_step = 0
                 episode_rewards.append(0)
                 for a in agent_rewards:
                     a.append(0)
                 agent_info.append([[]])
-                current_player_index = 0
 
             # increment global step counter
             train_step += 1
@@ -172,7 +155,7 @@ def train(arglist):
             if arglist.benchmark:
                 for i, info in enumerate(info_n):
                     agent_info[-1][i].append(info_n['n'])
-                if train_step > arglist.benchmark_iters and (done):
+                if train_step > arglist.benchmark_iters and (done or terminal):
                     file_name = arglist.benchmark_dir + arglist.exp_name + '.pkl'
                     print('Finished benchmarking, now saving...')
                     with open(file_name, 'wb') as fp:
@@ -192,6 +175,7 @@ def train(arglist):
                 agent.preupdate()
             for agent in trainers:
                 loss = agent.update(trainers, train_step)
+
                 if(loss is not None and agent.sleep_regimen and agent.agent_mic != 0 and train_step % 100 == 0): # Change sleep frequency here if desired
                     original_policy_loss = loss[1]
                     new_loss = agent.update(trainers, train_step, sleeping=True)[1]
@@ -202,10 +186,16 @@ def train(arglist):
                         #print("sleep walking")
 
             # save model, display training output
-            if done and  (len(episode_rewards) % arglist.save_rate == 0):
+            if terminal and (len(episode_rewards) % arglist.save_rate == 0):
                 U.save_state(arglist.save_dir, saver=saver)
-                print("steps: {}, episodes: {}, mean episode reward: {}, time: {}".format(
-                    train_step, len(episode_rewards), np.mean(episode_rewards[-arglist.save_rate:]), round(time.time()-t_start, 3)))
+                # print statement depends on whether or not there are adversaries
+                if num_adversaries == 0:
+                    print("steps: {}, episodes: {}, mean episode reward: {}, time: {}".format(
+                        train_step, len(episode_rewards), np.mean(episode_rewards[-arglist.save_rate:]), round(time.time()-t_start, 3)))
+                else:
+                    print("steps: {}, episodes: {}, mean episode reward: {}, agent episode reward: {}, time: {}".format(
+                        train_step, len(episode_rewards), np.mean(episode_rewards[-arglist.save_rate:]),
+                        [np.mean(rew[-arglist.save_rate:]) for rew in agent_rewards], round(time.time()-t_start, 3)))
                 t_start = time.time()
                 # Keep track of final episode reward
                 final_ep_rewards.append(np.mean(episode_rewards[-arglist.save_rate:]))
