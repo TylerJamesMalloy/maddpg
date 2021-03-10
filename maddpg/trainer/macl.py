@@ -225,6 +225,8 @@ class MACLAgentTrainer(AgentTrainer):
         if not t % 100 == 0:  # update every 100 steps
             return
 
+        
+
         smallest_batch_index = 0
         smallest_batch_size = -1
         for i in range(self.n):

@@ -9,7 +9,7 @@ tf.disable_v2_behavior()
 import numpy as np
 import maddpg.common.tf_util as U
 from tensorflow.python.ops import math_ops
-from multiagent.multi_discrete import MultiDiscrete
+#from multiagent.multi_discrete import MultiDiscrete
 from tensorflow.python.ops import nn
 
 class Pd(object):

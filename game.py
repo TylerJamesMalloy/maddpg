@@ -23,7 +23,7 @@ def parse_args():
     parser = argparse.ArgumentParser("Reinforcement Learning experiments for multiagent environments")
     # Environment
     parser.add_argument("--scenario", type=str, default="simple", help="name of the scenario script")
-    parser.add_argument("--max-episode-len", type=int, default=10, help="maximum episode length")
+    parser.add_argument("--max-episode-len", type=int, default=25, help="maximum episode length")
     parser.add_argument("--num-episodes", type=int, default=1000000, help="number of episodes")
     parser.add_argument("--num-adversaries", type=int, default=0, help="number of adversaries")
     parser.add_argument("--good-policy", type=str, default="maddpg", help="policy for good agents")
@@ -39,7 +39,7 @@ def parse_args():
     # Checkpointing
     parser.add_argument("--exp-name", type=str, default=None, help="name of the experiment")
     parser.add_argument("--save-dir", type=str, default="./", help="directory in which training state and model should be saved")
-    parser.add_argument("--save-rate", type=int, default=1000, help="save model once every time this many episodes are completed")
+    parser.add_argument("--save-rate", type=int, default=5000, help="save model once every time this many episodes are completed")
     parser.add_argument("--load-dir", type=str, default="", help="directory in which training state and model are loaded")
     # Evaluation
     parser.add_argument("--restore", action="store_true", default=False)
@@ -83,30 +83,36 @@ def get_trainers(env, num_adversaries, obs_shape_n, arglist):
 
 def train(arglist):
     with U.single_threaded_session():
-        if(arglist.scenario == "DouDizhu"):
-            from pettingzoo.classic import dou_dizhu_v1
-            env = dou_dizhu_v1.env(opponents_hand_visible=False) 
-        elif(arglist.scenario == "Uno"):
+        if(arglist.scenario == "Uno"):
             from pettingzoo.classic import uno_v1
             env = uno_v1.env(opponents_hand_visible=False)
         elif(arglist.scenario == "Texas"):
             from pettingzoo.classic import texas_holdem_no_limit_v1
             env = texas_holdem_no_limit_v1.env()
-        elif(arglist.scenario == "Mahjong"):
-            from pettingzoo.classic import mahjong_v1
-            env = mahjong_v1.env()
         elif(arglist.scenario == "Leduc"):
             from pettingzoo.classic import leduc_holdem_v1
             env = leduc_holdem_v1.env()
         elif(arglist.scenario == "Limit"):
             from pettingzoo.classic import texas_holdem_v1
             env = texas_holdem_v1.env()
-        elif(arglist.scenario == "Gin"):
-            from pettingzoo.classic import gin_rummy_v1
-            env = gin_rummy_v1.env(knock_reward = 0.5, gin_reward = 1.0, opponents_hand_visible = False)
         elif(arglist.scenario == "Backgammon"):
             from pettingzoo.classic import backgammon_v1
             env = backgammon_v1.env()
+        elif(arglist.scenario == "Adversary"):
+            from pettingzoo.mpe import simple_adversary_v2
+            env = simple_adversary_v2.env(N=2, max_cycles=25)
+        elif(arglist.scenario == "Crypto"):
+            from pettingzoo.mpe import simple_crypto_v2
+            env = simple_crypto_v2.env(max_cycles=25)
+        elif(arglist.scenario == "Spread"):
+            from pettingzoo.mpe import simple_spread_v2
+            env = simple_spread_v2.env(N=3, local_ratio=0.5, max_cycles=25)
+        elif(arglist.scenario == "SpeakerListener"):
+            from pettingzoo.mpe import simple_speaker_listener_v3
+            env = simple_speaker_listener_v3.env(max_cycles=25)
+        elif(arglist.scenario == "WorldCom"):   
+            from pettingzoo.mpe import simple_world_comm_v2
+            env = simple_world_comm_v2.env(num_good=2, num_adversaries=3, num_obstacles=1, num_food=2, max_cycles=25)
         else:
             print("no scenario found")
             assert(False)
@@ -148,17 +154,40 @@ def train(arglist):
             player_key = env.agent_selection
             obs = env.observe(agent=agent).flatten()
             action_probability = trainer.action(obs)
+
+            print("action_probability: ", action_probability)
+            
+            
             action = np.random.choice(a=np.linspace(0,len(action_probability)-1, num=len(action_probability), dtype=int), size=1, p=action_probability)[0]
+            
+            print(action)
+            print(env.observe(agent).flatten())
+            print(env.rewards)
+            print(env.dones) 
+            print(env.infos)
+            
             obs_n = env.observe(agent).flatten()
             env.step(action)
             new_obs_n, rew_n, done_n, info_n = env.observe(agent).flatten(), env.rewards, env.dones, env.infos
             player_info = info_n.get(player_key)
 
+            print(action)
+            print(env.observe(agent).flatten())
+            print(env.rewards)
+            print(env.dones) 
+            print(env.infos)
+
             rew_array = rew_n.values()
 
             episode_step += 1
             done = all(done_n)
-            terminal = False #(episode_step >= arglist.max_episode_len)
+            terminal = (episode_step >= arglist.max_episode_len) # False 
+
+            print(action)
+            print(env.observation_spaces)
+            print(env.observe(agent=agent).flatten())
+
+            assert(False)
 
             # experience(self, obs, act, mask, rew, new_obs, done)
             trainer.experience(obs_n, action_probability, None, [rew_n.get(player_key)], new_obs_n, done_n.get(player_key))

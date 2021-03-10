@@ -6,10 +6,7 @@ __pycache__/
 # C extensions
 *.so
 *.pkl
-experiments/OldResults/*
-experiments/Results/*
-experiments/Data/*
-experiments/Hanabi/*
+experiments/*
 
 # Distribution / packaging
 .Python
